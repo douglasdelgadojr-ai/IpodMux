@@ -195,7 +195,8 @@ class MuxSession(
         while (true) {
             val left = (end - System.currentTimeMillis()).toInt()
             if (left <= 0) return null
-            val p = recv(left) ?: return null
+            val p = recv(left)
+            if (p == null) return null
             if (p.proto != 6 || p.payload.size < 20) continue
             val bb = ByteBuffer.wrap(p.payload).order(ByteOrder.BIG_ENDIAN)
             val off = ((bb.get(12).toInt() and 0xf0) shr 4) * 4
@@ -226,4 +227,18 @@ class MuxSession(
                 log("Respuesta incompleta (${buf.size} bytes)")
                 return null
             }
-            val d = tcpRecv(left) ?:
+            val d = tcpRecv(left)
+            if (d == null) return null
+            buf += d
+            if (need < 0 && buf.size >= 4) {
+                need = ByteBuffer.wrap(buf).order(ByteOrder.BIG_ENDIAN).getInt(0)
+            }
+            if (need < 0 || need > (4 shl 20)) continue
+            if (buf.size >= 4 + need) return String(buf, 4, need)
+        }
+    }
+
+    fun tcpClose() {
+        send(6, tcpBytes(0x04, ByteArray(0)))
+    }
+}
