@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Typeface
+import android.hardware.usb.UsbConfiguration
 import android.hardware.usb.UsbConstants
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbEndpoint
@@ -85,7 +86,7 @@ class MainActivity : Activity() {
         if (Build.VERSION.SDK_INT >= 33) registerReceiver(permReceiver, f, Context.RECEIVER_NOT_EXPORTED)
         else registerReceiver(permReceiver, f)
 
-        log("iPod Mux Test v0.1 - Android ${Build.VERSION.RELEASE}")
+        log("iPod Mux Test v0.2 - Android ${Build.VERSION.RELEASE}")
         log("Conecta el iPod y toca 'Conectar y probar iPod'.")
     }
 
@@ -132,26 +133,45 @@ class MainActivity : Activity() {
     private fun runTest(dev: UsbDevice) {
         try {
             log(String.format("Dispositivo %s VID=%04x PID=%04x", dev.deviceName, dev.vendorId, dev.productId))
-            log("Configuraciones: ${dev.configurationCount}, interfaces: ${dev.interfaceCount}")
+            log("Configuraciones: ${dev.configurationCount}, interfaces (lista plana): ${dev.interfaceCount}")
+
             var iface: UsbInterface? = null
-            for (i in 0 until dev.interfaceCount) {
-                val f = dev.getInterface(i)
-                log("  iface[$i] id=${f.id} alt=${f.alternateSetting} clase=${f.interfaceClass}/${f.interfaceSubclass}/${f.interfaceProtocol} endpoints=${f.endpointCount}")
-                if (f.interfaceClass == 255 && f.interfaceSubclass == 254 && f.interfaceProtocol == 2) iface = f
+            var cfg: UsbConfiguration? = null
+            for (c in 0 until dev.configurationCount) {
+                val cf = dev.getConfiguration(c)
+                log("config[$c] id=${cf.id} interfaces=${cf.interfaceCount}")
+                for (i in 0 until cf.interfaceCount) {
+                    val f = cf.getInterface(i)
+                    log("   iface id=${f.id} alt=${f.alternateSetting} clase=${f.interfaceClass}/${f.interfaceSubclass}/${f.interfaceProtocol} endpoints=${f.endpointCount}")
+                    if (f.interfaceClass == 255 && f.interfaceSubclass == 254 && f.interfaceProtocol == 2) {
+                        iface = f
+                        cfg = cf
+                    }
+                }
             }
-            if (iface == null) {
+            val usbIface = iface
+            val usbCfg = cfg
+            if (usbIface == null || usbCfg == null) {
                 log("FALLO PASO 1: no encontre la interfaz usbmux")
                 return
             }
-            log("PASO 1 OK: interfaz usbmux encontrada")
+            log("PASO 1 OK: interfaz usbmux (id=${usbIface.id}) esta en la config id=${usbCfg.id}")
 
             val conn = usb.openDevice(dev)
             if (conn == null) {
                 log("FALLO PASO 2: openDevice devolvio null (permiso o firmware de la radio)")
                 return
             }
-            val claimed = conn.claimInterface(iface, true)
+
+            val setOk = conn.setConfiguration(usbCfg)
+            log("setConfiguration(id=${usbCfg.id}) = $setOk")
+
+            var claimed = conn.claimInterface(usbIface, true)
             log("claimInterface(force) = $claimed")
+            if (!claimed) {
+                claimed = conn.claimInterface(usbIface, false)
+                log("claimInterface(sin force) = $claimed")
+            }
             if (!claimed) {
                 log("FALLO PASO 2: no pude reclamar la interfaz")
                 conn.close()
@@ -161,8 +181,8 @@ class MainActivity : Activity() {
 
             var epIn: UsbEndpoint? = null
             var epOut: UsbEndpoint? = null
-            for (e in 0 until iface.endpointCount) {
-                val ep = iface.getEndpoint(e)
+            for (e in 0 until usbIface.endpointCount) {
+                val ep = usbIface.getEndpoint(e)
                 if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
                     if (ep.direction == UsbConstants.USB_DIR_IN) epIn = ep else epOut = ep
                 }
@@ -179,7 +199,7 @@ class MainActivity : Activity() {
             val mux = MuxSession(conn, inEp, outEp) { log(it) }
             if (!mux.handshake()) {
                 log("FALLO PASO 3: el iPod no respondio al handshake usbmux")
-                conn.releaseInterface(iface)
+                conn.releaseInterface(usbIface)
                 conn.close()
                 return
             }
@@ -187,7 +207,7 @@ class MainActivity : Activity() {
 
             if (!mux.tcpConnect(62078)) {
                 log("FALLO PASO 4: no pude abrir TCP a lockdownd")
-                conn.releaseInterface(iface)
+                conn.releaseInterface(usbIface)
                 conn.close()
                 return
             }
@@ -203,7 +223,7 @@ class MainActivity : Activity() {
             }
 
             mux.tcpClose()
-            conn.releaseInterface(iface)
+            conn.releaseInterface(usbIface)
             conn.close()
             log("=== FIN DE LA PRUEBA ===  Toca 'Copiar log' y mandame captura.")
         } catch (e: Exception) {
