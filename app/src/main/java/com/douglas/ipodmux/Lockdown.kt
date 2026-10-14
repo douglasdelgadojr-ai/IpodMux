@@ -30,7 +30,10 @@ class TlsBridge(
     private val ctx: SSLContext,
     private val inS: InputStream,
     private val outS: OutputStream,
-    private val protocols: Array<String>? = arrayOf("TLSv1")
+    private val protocols: Array<String>? = arrayOf("TLSv1"),
+    private val pickSuites: ((Array<String>) -> Array<String>)? = null,
+    private val sni: Boolean = true,
+    private val log: (String) -> Unit = {}
 ) {
     private fun pump(from: InputStream, to: OutputStream, s: Socket) {
         val buf = ByteArray(16384)
@@ -68,9 +71,17 @@ class TlsBridge(
         acceptor.start()
         val raw = Socket("127.0.0.1", port)
         raw.tcpNoDelay = true
-        val ssl = ctx.socketFactory.createSocket(raw, "ipod", port, true) as SSLSocket
+        val host: String? = if (sni) "ipod" else null
+        val ssl = ctx.socketFactory.createSocket(raw, host, port, true) as SSLSocket
         ssl.useClientMode = true
         if (protocols != null) ssl.enabledProtocols = protocols
+        val pick = pickSuites
+        if (pick != null) {
+            val sel = pick(ssl.supportedCipherSuites)
+            log("Suites elegidas: ${sel.joinToString()}")
+            if (sel.isEmpty()) throw IOException("este Android no ofrece esas suites")
+            ssl.enabledCipherSuites = sel
+        }
         ssl.soTimeout = 15000
         ssl.startHandshake()
         return ssl
@@ -93,7 +104,11 @@ class Lockdown(private val log: (String) -> Unit, private var inS: InputStream, 
             System.arraycopy(xml, 0, msg, 4, xml.size)
             outS.write(msg)
             outS.flush()
-            val h = readFully(inS, 4) ?: return null
+            val h = readFully(inS, 4)
+            if (h == null) {
+                log("lockdownd: el iPod cerro la conexion")
+                return null
+            }
             val n = ByteBuffer.wrap(h).order(ByteOrder.BIG_ENDIAN).getInt(0)
             if (n < 0 || n > (4 shl 20)) {
                 log("lockdownd: largo raro $n")
