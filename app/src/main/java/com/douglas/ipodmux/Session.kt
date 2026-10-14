@@ -150,62 +150,32 @@ object IpodSession {
         }
         val pr = rec ?: return fail(log, "FALLO PASO 6: sin registro de emparejamiento")
 
-        // PASO 7: sesion con TLS. Si el iPod corta la conexion, se prueba otra variante.
-        var ldCur: Lockdown = ld
-        var lcCur: MuxConn = lc
-        var ok = false
-        val variants = listOf("normal", "sin SNI", "RC4")
-        for ((k, vname) in variants.withIndex()) {
-            if (k > 0) {
-                try { lcCur.close() } catch (e: Exception) {}
-                for (s in sockets) try { s.close() } catch (e: Exception) {}
-                sockets.clear()
-                lcCur = m.open(62078) ?: return fail(log, "FALLO PASO 7: no pude reabrir lockdownd (variante $vname)")
-                ldCur = Lockdown(log, lcCur.input, lcCur.output)
-                if (!ldCur.validatePair(pr)) return fail(log, "FALLO PASO 7: ValidatePair fallo al reintentar")
+        // PASO 7: sesion con TLS (implementacion propia: MiniTls)
+        val ss = ld.startSession(pr) ?: return fail(log, "FALLO PASO 7: StartSession sin respuesta")
+        if (ss["Error"] != null) {
+            if (ss["Error"].toString().contains("InvalidHostID")) {
+                prefs.edit().clear().apply()
             }
-            log("PASO 7: sesion TLS, variante '$vname'")
-            val ss = ldCur.startSession(pr)
-            if (ss == null) {
-                log("StartSession sin respuesta")
-                continue
-            }
-            if (ss["Error"] != null) {
-                if (ss["Error"].toString().contains("InvalidHostID")) {
-                    prefs.edit().clear().apply()
-                }
-                return fail(log, "FALLO PASO 7: StartSession -> ${ss["Error"]} (vuelve a tocar Conectar)")
-            }
-            if (ss["EnableSessionSSL"] != true) {
-                log("PASO 7 OK: sesion sin TLS")
-                ok = true
-                break
-            }
-            lcCur.readTimeoutMs = 0
-            try {
-                val rc4Only: (Array<String>) -> Array<String> = { all ->
-                    all.filter { it.contains("RSA_WITH_RC4") && !it.contains("ECDHE") }.toTypedArray()
-                }
-                val pick: ((Array<String>) -> Array<String>)? = if (k == 2) rc4Only else null
-                val sock = TlsBridge(Certs.tlsContext(pr), lcCur.input, lcCur.output, arrayOf("TLSv1"), pick, k == 0, log).connect()
-                sockets.add(sock)
-                ldCur.switchStreams(sock.inputStream, sock.outputStream)
-                log("TLS abierto (${sock.session.protocol}, ${sock.session.cipherSuite})")
-                val pt = ldCur.getValue("ProductType")
-                if (pt != null) {
-                    log("PASO 7 OK: ProductType = $pt")
-                    ok = true
-                    break
-                }
-                log("Variante '$vname': el iPod corto la conexion despues del TLS")
-            } catch (e: Exception) {
-                log("Variante '$vname': ${e.javaClass.simpleName}: ${e.message}")
-            }
+            return fail(log, "FALLO PASO 7: StartSession -> ${ss["Error"]} (vuelve a tocar Conectar)")
         }
-        if (!ok) return fail(log, "FALLO PASO 7: ninguna variante de TLS funciono")
+        if (ss["EnableSessionSSL"] == true) {
+            lc.readTimeoutMs = 15000
+            try {
+                val tls = MiniTls.create(pr, lc.input, lc.output, log)
+                tls.handshake()
+                lc.readTimeoutMs = 0
+                ld.switchStreams(tls.input, tls.output)
+            } catch (e: Exception) {
+                return fail(log, "FALLO PASO 7: TLS propio: ${e.javaClass.simpleName}: ${e.message}")
+            }
+            log("PASO 7 OK: sesion TLS abierta (TLS propio)")
+        } else {
+            log("PASO 7 OK: sesion sin TLS")
+        }
+        log("ProductType: ${ld.getValue("ProductType")}")
 
         // PASO 8: servicio de archivos
-        val sv = ldCur.startService("com.apple.afc") ?: return fail(log, "FALLO PASO 8: StartService sin respuesta")
+        val sv = ld.startService("com.apple.afc") ?: return fail(log, "FALLO PASO 8: StartService sin respuesta")
         val port = (sv["Port"] as? Long)?.toInt()
         if (port == null) return fail(log, "FALLO PASO 8: StartService -> ${sv["Error"] ?: sv}")
         val ac = m.open(port) ?: return fail(log, "FALLO PASO 8: no pude abrir AFC (puerto $port)")
@@ -213,14 +183,16 @@ object IpodSession {
         var aout = ac.output
         if (sv["EnableServiceSSL"] == true) {
             ac.readTimeoutMs = 0
-            val sock = try {
-                TlsBridge(Certs.tlsContext(pr), ac.input, ac.output).connect()
+            try {
+                ac.readTimeoutMs = 15000
+                val tls = MiniTls.create(pr, ac.input, ac.output, log)
+                tls.handshake()
+                ac.readTimeoutMs = 0
+                ain = tls.input
+                aout = tls.output
             } catch (e: Exception) {
                 return fail(log, "FALLO PASO 8: TLS de AFC: ${e.javaClass.simpleName}: ${e.message}")
             }
-            sockets.add(sock)
-            ain = sock.inputStream
-            aout = sock.outputStream
         }
         val a = Afc(ain, aout, log)
         log("PASO 8 OK: AFC abierto. Raiz: ${a.listDir("/")}")
