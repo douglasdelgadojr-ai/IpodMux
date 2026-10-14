@@ -8,118 +8,107 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Color
 import android.graphics.Typeface
-import android.hardware.usb.UsbConfiguration
-import android.hardware.usb.UsbConstants
+import android.graphics.drawable.GradientDrawable
 import android.hardware.usb.UsbDevice
-import android.hardware.usb.UsbEndpoint
-import android.hardware.usb.UsbInterface
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
+import android.view.ViewGroup
+import android.widget.BaseAdapter
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ListView
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 
+class MenuItem(val label: String, val sub: Boolean = true, val action: () -> Unit)
+class Screen(val title: String, val items: List<MenuItem>, var sel: Int = 0)
+
 class MainActivity : Activity() {
     private lateinit var usb: UsbManager
-    private lateinit var logView: TextView
-    private lateinit var scroll: ScrollView
     private val ui = Handler(Looper.getMainLooper())
     private val sb = StringBuilder()
     private val actionPerm = "com.douglas.ipodmux.USB_PERMISSION"
 
+    private lateinit var titleView: TextView
+    private lateinit var stateView: TextView
+    private lateinit var listView: ListView
+    private lateinit var adapter: MenuAdapter
+    private lateinit var nowPane: LinearLayout
+    private lateinit var nowTitle: TextView
+    private lateinit var nowArtist: TextView
+    private lateinit var nowAlbum: TextView
+    private lateinit var nowCount: TextView
+    private lateinit var nowStatus: TextView
+    private lateinit var nowTime: TextView
+    private lateinit var nowBar: ProgressBar
+    private lateinit var logPane: LinearLayout
+    private lateinit var logView: TextView
+    private lateinit var logScroll: ScrollView
+
+    private val stack = ArrayList<Screen>()
+    private var mode = 0 // 0 lista, 1 reproduciendo, 2 registro
+    private var statusLine = "Conecta el iPod por USB"
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    // ---------------------------------------------------------------- USB
     @Suppress("DEPRECATION")
     private fun deviceFrom(i: Intent): UsbDevice? =
         if (Build.VERSION.SDK_INT >= 33) i.getParcelableExtra(UsbManager.EXTRA_DEVICE, UsbDevice::class.java)
         else i.getParcelableExtra(UsbManager.EXTRA_DEVICE)
 
-    private val permReceiver = object : BroadcastReceiver() {
+    private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(c: Context, i: Intent) {
-            if (i.action != actionPerm) return
-            val dev = deviceFrom(i)
-            val granted = i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
-            if (granted && dev != null) {
-                log("Permiso USB concedido")
-                Thread { runTest(dev) }.start()
-            } else {
-                log("Permiso USB DENEGADO (granted=$granted)")
+            when (i.action) {
+                actionPerm -> {
+                    val dev = deviceFrom(i)
+                    if (i.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false) && dev != null) {
+                        log("Permiso USB concedido")
+                        connectInBackground(dev)
+                    } else log("Permiso USB DENEGADO")
+                }
+                UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+                    val dev = deviceFrom(i)
+                    if (dev != null && dev.vendorId == 0x05ac) {
+                        log("iPod desconectado")
+                        Player.stopAll()
+                        IpodSession.disconnect()
+                        statusLine = "iPod desconectado"
+                        rebuildMain()
+                    }
+                }
             }
         }
     }
 
-    override fun onCreate(s: Bundle?) {
-        super.onCreate(s)
-        usb = getSystemService(Context.USB_SERVICE) as UsbManager
+    private fun findIpod(): UsbDevice? = usb.deviceList.values.firstOrNull { it.vendorId == 0x05ac }
 
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setPadding(24, 24, 24, 24)
-
-        val row = LinearLayout(this)
-        row.orientation = LinearLayout.HORIZONTAL
-        val b1 = Button(this)
-        b1.text = "Conectar y probar iPod"
-        b1.setOnClickListener { start() }
-        val b2 = Button(this)
-        b2.text = "Copiar log"
-        b2.setOnClickListener { copyLog() }
-        row.addView(b1)
-        row.addView(b2)
-
-        logView = TextView(this)
-        logView.typeface = Typeface.MONOSPACE
-        logView.textSize = 14f
-        scroll = ScrollView(this)
-        scroll.addView(logView)
-
-        root.addView(row)
-        root.addView(scroll, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
-        setContentView(root)
-
-        val f = IntentFilter(actionPerm)
-        if (Build.VERSION.SDK_INT >= 33) registerReceiver(permReceiver, f, Context.RECEIVER_NOT_EXPORTED)
-        else registerReceiver(permReceiver, f)
-
-        log("iPod Mux Test v0.2 - Android ${Build.VERSION.RELEASE}")
-        log("Conecta el iPod y toca 'Conectar y probar iPod'.")
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        unregisterReceiver(permReceiver)
-    }
-
-    private fun log(m: String) {
-        val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
-        ui.post {
-            sb.append(t).append("  ").append(m).append('\n')
-            logView.text = sb.toString()
-            scroll.post { scroll.fullScroll(View.FOCUS_DOWN) }
+    private fun tryConnect() {
+        if (IpodSession.connecting) return
+        if (IpodSession.isConnected()) {
+            log("Ya hay un iPod conectado")
+            return
         }
-    }
-
-    private fun copyLog() {
-        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("log", sb.toString()))
-        Toast.makeText(this, "Log copiado", Toast.LENGTH_SHORT).show()
-    }
-
-    private fun start() {
-        log("Buscando iPod (VID 05ac)...")
-        val dev = usb.deviceList.values.firstOrNull { it.vendorId == 0x05ac }
+        val dev = findIpod()
         if (dev == null) {
-            val all = usb.deviceList.values.joinToString { String.format("%04x:%04x", it.vendorId, it.productId) }
-            log("No hay dispositivo Apple conectado. Dispositivos USB: [$all]")
+            statusLine = "No hay iPod conectado"
+            log("No hay dispositivo Apple conectado")
+            rebuildMain()
             return
         }
         if (usb.hasPermission(dev)) {
-            Thread { runTest(dev) }.start()
+            connectInBackground(dev)
         } else {
             log("Pidiendo permiso USB... acepta el cuadro en pantalla")
             val pi = PendingIntent.getBroadcast(
@@ -130,104 +119,409 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun runTest(dev: UsbDevice) {
-        try {
-            log(String.format("Dispositivo %s VID=%04x PID=%04x", dev.deviceName, dev.vendorId, dev.productId))
-            log("Configuraciones: ${dev.configurationCount}, interfaces (lista plana): ${dev.interfaceCount}")
-
-            var iface: UsbInterface? = null
-            var cfg: UsbConfiguration? = null
-            for (c in 0 until dev.configurationCount) {
-                val cf = dev.getConfiguration(c)
-                log("config[$c] id=${cf.id} interfaces=${cf.interfaceCount}")
-                for (i in 0 until cf.interfaceCount) {
-                    val f = cf.getInterface(i)
-                    log("   iface id=${f.id} alt=${f.alternateSetting} clase=${f.interfaceClass}/${f.interfaceSubclass}/${f.interfaceProtocol} endpoints=${f.endpointCount}")
-                    if (f.interfaceClass == 255 && f.interfaceSubclass == 254 && f.interfaceProtocol == 2) {
-                        iface = f
-                        cfg = cf
-                    }
-                }
+    private fun connectInBackground(dev: UsbDevice) {
+        if (IpodSession.connecting) return
+        statusLine = "Conectando con el iPod..."
+        rebuildMain()
+        Thread {
+            val ok = IpodSession.connect(applicationContext, usb, dev) { log(it) }
+            ui.post {
+                statusLine = if (ok) IpodSession.deviceName else "Fallo la conexion (mira el registro)"
+                rebuildMain()
             }
-            val usbIface = iface
-            val usbCfg = cfg
-            if (usbIface == null || usbCfg == null) {
-                log("FALLO PASO 1: no encontre la interfaz usbmux")
-                return
-            }
-            log("PASO 1 OK: interfaz usbmux (id=${usbIface.id}) esta en la config id=${usbCfg.id}")
+        }.start()
+    }
 
-            val conn = usb.openDevice(dev)
-            if (conn == null) {
-                log("FALLO PASO 2: openDevice devolvio null (permiso o firmware de la radio)")
-                return
-            }
+    // ---------------------------------------------------------------- menus
+    private fun rebuildMain() {
+        if (mode == 2) return
+        stack.clear()
+        push(mainMenu(), keepMode = true)
+        if (mode == 1 && Player.current == null) mode = 0
+        applyMode()
+    }
 
-            val setOk = conn.setConfiguration(usbCfg)
-            log("setConfiguration(id=${usbCfg.id}) = $setOk")
-
-            var claimed = conn.claimInterface(usbIface, true)
-            log("claimInterface(force) = $claimed")
-            if (!claimed) {
-                claimed = conn.claimInterface(usbIface, false)
-                log("claimInterface(sin force) = $claimed")
-            }
-            if (!claimed) {
-                log("FALLO PASO 2: no pude reclamar la interfaz")
-                conn.close()
-                return
-            }
-            log("PASO 2 OK: interfaz reclamada")
-
-            var epIn: UsbEndpoint? = null
-            var epOut: UsbEndpoint? = null
-            for (e in 0 until usbIface.endpointCount) {
-                val ep = usbIface.getEndpoint(e)
-                if (ep.type == UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                    if (ep.direction == UsbConstants.USB_DIR_IN) epIn = ep else epOut = ep
-                }
-            }
-            val inEp = epIn
-            val outEp = epOut
-            if (inEp == null || outEp == null) {
-                log("FALLO: no encontre endpoints bulk IN/OUT")
-                conn.close()
-                return
-            }
-            log(String.format("Endpoints: IN=0x%02x OUT=0x%02x", inEp.address, outEp.address))
-
-            val mux = MuxSession(conn, inEp, outEp) { log(it) }
-            if (!mux.handshake()) {
-                log("FALLO PASO 3: el iPod no respondio al handshake usbmux")
-                conn.releaseInterface(usbIface)
-                conn.close()
-                return
-            }
-            log("PASO 3 OK: handshake usbmux")
-
-            if (!mux.tcpConnect(62078)) {
-                log("FALLO PASO 4: no pude abrir TCP a lockdownd")
-                conn.releaseInterface(usbIface)
-                conn.close()
-                return
-            }
-            log("PASO 4 OK: conectado a lockdownd")
-
-            val q = mux.lockdownRequest(lockdownXml("QueryType"))
-            log("QueryType -> ${q?.take(600) ?: "sin respuesta"}")
-            if (q != null) log("PASO 5 OK: lockdownd responde")
-
-            for (k in listOf("ProductVersion", "DeviceName", "ProductType")) {
-                val r = mux.lockdownRequest(lockdownXml("GetValue", k))
-                log("GetValue $k -> ${r?.take(400) ?: "sin respuesta"}")
-            }
-
-            mux.tcpClose()
-            conn.releaseInterface(usbIface)
-            conn.close()
-            log("=== FIN DE LA PRUEBA ===  Toca 'Copiar log' y mandame captura.")
-        } catch (e: Exception) {
-            log("EXCEPCION: ${e.javaClass.simpleName}: ${e.message}")
+    private fun mainMenu(): Screen {
+        val lib = IpodSession.library
+        val items = ArrayList<MenuItem>()
+        if (lib != null) {
+            items.add(MenuItem("Música") { push(musicMenu(lib)) })
+            items.add(MenuItem("Reproduciendo ahora") { showNow() })
+            items.add(MenuItem("Aleatorio") { shuffleAll(lib) })
+        } else {
+            items.add(MenuItem(if (IpodSession.connecting) "Conectando..." else "Conectar iPod", false) { tryConnect() })
         }
+        items.add(MenuItem("Registro (log)") { showLog() })
+        return Screen(if (lib != null) IpodSession.deviceName else "iPod USB", items)
+    }
+
+    private fun musicMenu(lib: Library): Screen {
+        val items = ArrayList<MenuItem>()
+        items.add(MenuItem("Artistas") {
+            push(Screen("Artistas", lib.artists.map { a -> MenuItem(a.first) { push(trackMenu(a.first, a.second)) } }))
+        })
+        items.add(MenuItem("Álbumes") {
+            push(Screen("Álbumes", lib.albums.map { a -> MenuItem(a.first) { push(trackMenu(a.first, a.second)) } }))
+        })
+        items.add(MenuItem("Canciones") { push(trackMenu("Canciones", lib.tracks)) })
+        return Screen("Música", items)
+    }
+
+    private fun trackMenu(title: String, tracks: List<Track>): Screen {
+        val items = tracks.mapIndexed { i, t ->
+            MenuItem(t.title, false) {
+                Player.play(tracks, i)
+                showNow()
+            }
+        }
+        return Screen(title, items)
+    }
+
+    private fun shuffleAll(lib: Library) {
+        val q = lib.tracks.shuffled()
+        if (q.isEmpty()) return
+        Player.play(q, 0)
+        showNow()
+    }
+
+    private fun push(s: Screen, keepMode: Boolean = false) {
+        stack.add(s)
+        if (!keepMode) mode = 0
+        showScreen(s)
+        applyMode()
+    }
+
+    private fun showScreen(s: Screen) {
+        titleView.text = s.title
+        adapter.items = s.items
+        adapter.selected = s.sel
+        adapter.notifyDataSetChanged()
+        listView.setSelection(maxOf(0, s.sel - 2))
+    }
+
+    private fun showNow() {
+        mode = 1
+        applyMode()
+        updateNow()
+    }
+
+    private fun showLog() {
+        mode = 2
+        applyMode()
+    }
+
+    private fun back(): Boolean {
+        if (mode != 0) {
+            mode = 0
+            applyMode()
+            if (stack.isNotEmpty()) showScreen(stack.last())
+            return true
+        }
+        if (stack.size > 1) {
+            stack.removeAt(stack.size - 1)
+            showScreen(stack.last())
+            return true
+        }
+        return false
+    }
+
+    private fun applyMode() {
+        listView.visibility = if (mode == 0) View.VISIBLE else View.GONE
+        nowPane.visibility = if (mode == 1) View.VISIBLE else View.GONE
+        logPane.visibility = if (mode == 2) View.VISIBLE else View.GONE
+        titleView.text = when (mode) {
+            1 -> "Reproduciendo"
+            2 -> "Registro"
+            else -> stack.lastOrNull()?.title ?: "iPod USB"
+        }
+    }
+
+    // ---------------------------------------------------------------- entrada (rueda, teclas, volante)
+    private fun turn(d: Int) {
+        when (mode) {
+            0 -> {
+                val s = stack.lastOrNull() ?: return
+                if (s.items.isEmpty()) return
+                s.sel = (s.sel + d).coerceIn(0, s.items.size - 1)
+                adapter.selected = s.sel
+                adapter.notifyDataSetChanged()
+                val first = listView.firstVisiblePosition
+                val last = listView.lastVisiblePosition
+                if (s.sel <= first || s.sel >= last) listView.setSelection(maxOf(0, s.sel - 3))
+            }
+            1 -> Player.adjustVolume(d)
+            2 -> logScroll.smoothScrollBy(0, d * dp(80))
+        }
+    }
+
+    private fun center() {
+        when (mode) {
+            0 -> {
+                val s = stack.lastOrNull() ?: return
+                s.items.getOrNull(s.sel)?.action?.invoke()
+            }
+            1 -> Player.toggle()
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_DOWN -> turn(1)
+            KeyEvent.KEYCODE_DPAD_UP -> turn(-1)
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER -> center()
+            KeyEvent.KEYCODE_BACK -> if (!back()) return super.onKeyDown(keyCode, event)
+            KeyEvent.KEYCODE_MEDIA_NEXT -> Player.next()
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> Player.prev()
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, KeyEvent.KEYCODE_MEDIA_PLAY, KeyEvent.KEYCODE_MEDIA_PAUSE -> Player.toggle()
+            else -> return super.onKeyDown(keyCode, event)
+        }
+        return true
+    }
+
+    // ---------------------------------------------------------------- pantalla "Reproduciendo"
+    private fun fmt(ms: Int): String {
+        val s = ms / 1000
+        return String.format("%d:%02d", s / 60, s % 60)
+    }
+
+    private fun updateNow() {
+        val t = Player.current
+        stateView.text = if (Player.playing) ">" else if (Player.loading) "..." else "||"
+        if (t == null) {
+            nowTitle.text = "Nada en reproducción"
+            nowArtist.text = ""
+            nowAlbum.text = ""
+            nowCount.text = ""
+            nowStatus.text = ""
+            nowTime.text = ""
+            nowBar.progress = 0
+            return
+        }
+        nowTitle.text = t.title
+        nowArtist.text = t.artist
+        nowAlbum.text = t.album
+        nowCount.text = "${Player.index + 1} de ${Player.queue.size}"
+        nowStatus.text = Player.statusText
+        val dur = Player.duration()
+        val pos = Player.position()
+        nowTime.text = if (dur > 0) "${fmt(pos)} / ${fmt(dur)}" else fmt(pos)
+        nowBar.progress = if (dur > 0) (pos.toLong() * 1000 / dur).toInt() else 0
+    }
+
+    private val ticker = object : Runnable {
+        override fun run() {
+            if (mode == 1 || Player.playing) updateNow()
+            ui.postDelayed(this, 500)
+        }
+    }
+
+    // ---------------------------------------------------------------- registro
+    private fun log(m: String) {
+        val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        ui.post {
+            sb.append(t).append("  ").append(m).append('\n')
+            logView.text = sb.toString()
+            logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    private fun copyLog() {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("log", sb.toString()))
+        Toast.makeText(this, "Log copiado", Toast.LENGTH_SHORT).show()
+    }
+
+    // ---------------------------------------------------------------- construccion de la interfaz
+    private inner class MenuAdapter : BaseAdapter() {
+        var items: List<MenuItem> = emptyList()
+        var selected = 0
+
+        override fun getCount() = items.size
+        override fun getItem(p: Int): Any = items[p]
+        override fun getItemId(p: Int) = p.toLong()
+
+        override fun getView(p: Int, convert: View?, parent: ViewGroup?): View {
+            val row: LinearLayout
+            val label: TextView
+            val chev: TextView
+            if (convert == null) {
+                row = LinearLayout(this@MainActivity)
+                row.orientation = LinearLayout.HORIZONTAL
+                row.gravity = Gravity.CENTER_VERTICAL
+                row.setPadding(dp(14), 0, dp(14), 0)
+                row.layoutParams = AbsListViewParams(dp(52))
+                label = TextView(this@MainActivity)
+                label.textSize = 22f
+                label.maxLines = 1
+                label.ellipsize = android.text.TextUtils.TruncateAt.END
+                chev = TextView(this@MainActivity)
+                chev.textSize = 24f
+                chev.typeface = Typeface.DEFAULT_BOLD
+                row.addView(label, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                row.addView(chev, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            } else {
+                row = convert as LinearLayout
+                label = row.getChildAt(0) as TextView
+                chev = row.getChildAt(1) as TextView
+            }
+            val it = items[p]
+            label.text = it.label
+            chev.text = if (it.sub) ">" else ""
+            if (p == selected) {
+                val g = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFF5AB0FF.toInt(), 0xFF0A6FD6.toInt()))
+                row.background = g
+                label.setTextColor(Color.WHITE)
+                chev.setTextColor(Color.WHITE)
+            } else {
+                row.setBackgroundColor(Color.WHITE)
+                label.setTextColor(Color.BLACK)
+                chev.setTextColor(0xFF888888.toInt())
+            }
+            return row
+        }
+    }
+
+    private fun AbsListViewParams(h: Int) = android.widget.AbsListView.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, h)
+
+    private fun tv(size: Float, color: Int, bold: Boolean = false): TextView {
+        val t = TextView(this)
+        t.textSize = size
+        t.setTextColor(color)
+        if (bold) t.typeface = Typeface.DEFAULT_BOLD
+        t.maxLines = 2
+        t.ellipsize = android.text.TextUtils.TruncateAt.END
+        return t
+    }
+
+    override fun onCreate(s: Bundle?) {
+        super.onCreate(s)
+        usb = getSystemService(Context.USB_SERVICE) as UsbManager
+        Player.init(applicationContext)
+
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.HORIZONTAL
+        root.setBackgroundColor(0xFF1C1C1E.toInt())
+        root.setPadding(dp(16), dp(10), dp(16), dp(10))
+
+        // --- "pantalla" del iPod (izquierda)
+        val screen = LinearLayout(this)
+        screen.orientation = LinearLayout.VERTICAL
+        val frame = GradientDrawable()
+        frame.setColor(Color.WHITE)
+        frame.setStroke(dp(4), 0xFF9A9A9A.toInt())
+        frame.cornerRadius = dp(10).toFloat()
+        screen.background = frame
+        screen.setPadding(dp(4), dp(4), dp(4), dp(4))
+
+        val header = FrameLayout(this)
+        header.background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0xFFF4F4F4.toInt(), 0xFFB9B9B9.toInt()))
+        titleView = tv(20f, Color.BLACK, true)
+        titleView.gravity = Gravity.CENTER
+        titleView.maxLines = 1
+        stateView = tv(18f, 0xFF333333.toInt(), true)
+        header.addView(titleView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+        val sl = FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40), Gravity.END)
+        stateView.gravity = Gravity.CENTER_VERTICAL
+        stateView.setPadding(0, 0, dp(12), 0)
+        header.addView(stateView, sl)
+        screen.addView(header, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(40)))
+
+        val body = FrameLayout(this)
+        listView = ListView(this)
+        listView.divider = null
+        adapter = MenuAdapter()
+        listView.adapter = adapter
+        listView.setOnItemClickListener { _, _, pos, _ ->
+            val sc = stack.lastOrNull()
+            if (sc != null) {
+                sc.sel = pos
+                adapter.selected = pos
+                adapter.notifyDataSetChanged()
+                center()
+            }
+        }
+        body.addView(listView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        nowPane = LinearLayout(this)
+        nowPane.orientation = LinearLayout.VERTICAL
+        nowPane.setPadding(dp(20), dp(14), dp(20), dp(10))
+        nowPane.setBackgroundColor(Color.WHITE)
+        nowCount = tv(16f, 0xFF666666.toInt())
+        nowTitle = tv(26f, Color.BLACK, true)
+        nowArtist = tv(22f, 0xFF222222.toInt())
+        nowAlbum = tv(20f, 0xFF666666.toInt())
+        nowStatus = tv(16f, 0xFFB00020.toInt())
+        nowTime = tv(18f, 0xFF333333.toInt())
+        nowBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        nowBar.max = 1000
+        nowPane.addView(nowCount)
+        nowPane.addView(nowTitle)
+        nowPane.addView(nowArtist)
+        nowPane.addView(nowAlbum)
+        nowPane.addView(nowStatus)
+        val sp = View(this)
+        nowPane.addView(sp, LinearLayout.LayoutParams(1, 0, 1f))
+        nowPane.addView(nowBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(14)))
+        nowPane.addView(nowTime)
+        body.addView(nowPane, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        logPane = LinearLayout(this)
+        logPane.orientation = LinearLayout.VERTICAL
+        logPane.setBackgroundColor(Color.WHITE)
+        val cp = Button(this)
+        cp.text = "Copiar log"
+        cp.setOnClickListener { copyLog() }
+        logView = TextView(this)
+        logView.typeface = Typeface.MONOSPACE
+        logView.textSize = 13f
+        logView.setTextColor(Color.BLACK)
+        logScroll = ScrollView(this)
+        logScroll.addView(logView)
+        logPane.addView(cp, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        logPane.addView(logScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        body.addView(logPane, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        screen.addView(body, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        root.addView(screen, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1.5f))
+
+        // --- rueda (derecha)
+        val wheel = ClickWheelView(this)
+        wheel.onTurn = { turn(it) }
+        wheel.onCenter = { center() }
+        wheel.onMenu = { back() }
+        wheel.onNext = { Player.next() }
+        wheel.onPrev = { Player.prev() }
+        wheel.onPlayPause = { Player.toggle() }
+        val wl = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+        wl.leftMargin = dp(16)
+        root.addView(wheel, wl)
+        setContentView(root)
+
+        val f = IntentFilter(actionPerm)
+        f.addAction(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        if (Build.VERSION.SDK_INT >= 33) registerReceiver(usbReceiver, f, Context.RECEIVER_NOT_EXPORTED)
+        else registerReceiver(usbReceiver, f)
+
+        Player.onLog = { log(it) }
+        Player.onChange = { updateNow() }
+
+        log("iPod USB v0.3 - Android ${Build.VERSION.RELEASE}")
+        push(mainMenu())
+        applyMode()
+        ui.post(ticker)
+        if (IpodSession.isConnected()) rebuildMain() else ui.postDelayed({ tryConnect() }, 600)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == UsbManager.ACTION_USB_DEVICE_ATTACHED) ui.postDelayed({ tryConnect() }, 600)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        ui.removeCallbacks(ticker)
+        Player.onChange = null
+        Player.onLog = null
+        unregisterReceiver(usbReceiver)
     }
 }
