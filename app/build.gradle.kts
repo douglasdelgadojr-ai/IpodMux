@@ -8,10 +8,10 @@ android {
     compileSdk = 34
     defaultConfig {
         applicationId = "com.douglas.ipodmux"
-        minSdk = 21
+        minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 3
+        versionName = "0.3"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
