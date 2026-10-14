@@ -2,8 +2,16 @@ package com.douglas.ipodmux
 
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
+import java.io.IOException
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.TimeUnit
 
 fun hex(b: ByteArray, max: Int = 64): String {
     val n = minOf(b.size, max)
@@ -13,16 +21,94 @@ fun hex(b: ByteArray, max: Int = 64): String {
     return sb.toString()
 }
 
-fun lockdownXml(request: String, key: String? = null): String {
-    val extra = if (key != null) "<key>Key</key><string>$key</string>" else ""
-    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
-        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
-        "<plist version=\"1.0\">\n<dict><key>Request</key><string>$request</string>$extra" +
-        "<key>Label</key><string>ipodmux</string></dict>\n</plist>\n"
+/** Una conexion TCP (de usbmux) con un servicio del iPod. Expone streams normales. */
+class MuxConn(private val mux: Mux, val sport: Int, val dport: Int) {
+    @Volatile var seqOut = 0L
+    @Volatile var ackOut = 0L
+    @Volatile var closed = false
+    @Volatile var refused = false
+    @Volatile var readTimeoutMs = 20000
+    val established = CountDownLatch(1)
+    private val queue = LinkedBlockingQueue<ByteArray>()
+    private val eofMarker = ByteArray(0)
+
+    internal fun deliver(data: ByteArray) { queue.add(data) }
+
+    internal fun markClosed() {
+        if (!closed) {
+            closed = true
+            queue.add(eofMarker)
+        }
+        established.countDown()
+    }
+
+    val input: InputStream = object : InputStream() {
+        private var cur: ByteArray? = null
+        private var pos = 0
+        private var eof = false
+
+        override fun read(): Int {
+            val one = ByteArray(1)
+            val n = read(one, 0, 1)
+            return if (n <= 0) -1 else (one[0].toInt() and 0xff)
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (len == 0) return 0
+            val tmo = readTimeoutMs
+            val deadline = if (tmo > 0) System.currentTimeMillis() + tmo else Long.MAX_VALUE
+            while (cur == null || pos >= cur!!.size) {
+                if (eof) return -1
+                val remaining = deadline - System.currentTimeMillis()
+                if (remaining <= 0) throw SocketTimeoutException("usbmux: tiempo de espera agotado")
+                val n = queue.poll(minOf(remaining, 500L), TimeUnit.MILLISECONDS) ?: continue
+                if (n === eofMarker) {
+                    eof = true
+                    return -1
+                }
+                cur = n
+                pos = 0
+            }
+            val c = cur!!
+            val k = minOf(len, c.size - pos)
+            System.arraycopy(c, pos, b, off, k)
+            pos += k
+            return k
+        }
+
+        override fun available(): Int {
+            val c = cur
+            return if (c == null) 0 else c.size - pos
+        }
+    }
+
+    val output: OutputStream = object : OutputStream() {
+        override fun write(b: Int) {
+            write(byteArrayOf(b.toByte()), 0, 1)
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            if (closed) throw IOException("usbmux: conexion cerrada")
+            var o = 0
+            while (o < len) {
+                val n = minOf(4096, len - o)
+                if (!mux.sendTcp(this@MuxConn, 0x10, b.copyOfRange(off + o, off + o + n), true)) {
+                    throw IOException("usbmux: fallo al enviar por USB")
+                }
+                o += n
+            }
+        }
+    }
+
+    fun close() {
+        if (!closed) mux.sendTcp(this, 0x04, ByteArray(0), false)
+        markClosed()
+        mux.remove(this)
+    }
 }
 
-/** Capa usbmux (el protocolo que usa iTunes sobre USB) + un TCP minimo encima. */
-class MuxSession(
+/** Capa usbmux (el protocolo que usa iTunes sobre USB) con varias conexiones TCP encima. */
+class Mux(
     private val conn: UsbDeviceConnection,
     private val epIn: UsbEndpoint,
     private val epOut: UsbEndpoint,
@@ -31,14 +117,20 @@ class MuxSession(
     var version = -1
         private set
     private var txSeq = 0
-    private var rxSeq = 0xFFFF
-    private var pending = ByteArray(0)
+    @Volatile private var rxSeq = 0xFFFF
+    private val sendLock = Any()
+    private var rbuf = ByteArray(1 shl 16)
+    private var rlen = 0
+    private val inBuf = ByteArray(16384)
+    private val conns = ConcurrentHashMap<Int, MuxConn>()
+    @Volatile private var running = false
+    private var nextPort = 1
 
     class Packet(val proto: Int, val payload: ByteArray)
 
     private fun headerLen(proto: Int) = if (proto == 0 || version < 2) 8 else 16
 
-    private fun send(proto: Int, payload: ByteArray): Boolean {
+    private fun send(proto: Int, payload: ByteArray): Boolean = synchronized(sendLock) {
         val hl = headerLen(proto)
         val bb = ByteBuffer.allocate(hl + payload.size).order(ByteOrder.BIG_ENDIAN)
         bb.putInt(proto)
@@ -54,44 +146,55 @@ class MuxSession(
         val r = conn.bulkTransfer(epOut, data, data.size, 3000)
         if (r != data.size) {
             log("ERROR enviando por bulk: devolvio $r de ${data.size}")
-            return false
-        }
-        return true
+            false
+        } else true
+    }
+
+    private fun ensure(n: Int) {
+        if (n > rbuf.size) rbuf = rbuf.copyOf(maxOf(n, rbuf.size * 2))
+    }
+
+    private fun consume(n: Int) {
+        System.arraycopy(rbuf, n, rbuf, 0, rlen - n)
+        rlen -= n
     }
 
     private fun parseOne(): Packet? {
-        if (pending.size < 8) return null
-        val bb = ByteBuffer.wrap(pending).order(ByteOrder.BIG_ENDIAN)
+        if (rlen < 8) return null
+        val bb = ByteBuffer.wrap(rbuf, 0, rlen).order(ByteOrder.BIG_ENDIAN)
         val proto = bb.getInt(0)
         val len = bb.getInt(4)
         if (len < 8 || len > (1 shl 20)) {
-            log("Paquete con longitud rara ($len). Buffer: ${hex(pending)}")
-            pending = ByteArray(0)
+            log("Paquete con longitud rara ($len). Buffer: ${hex(rbuf.copyOf(minOf(rlen, 32)))}")
+            rlen = 0
             return null
         }
-        if (pending.size < len) return null
+        if (rlen < len) return null
         val hl = headerLen(proto)
         if (len < hl) {
-            log("Paquete mas corto que su cabecera: ${hex(pending)}")
-            pending = pending.copyOfRange(len, pending.size)
+            log("Paquete mas corto que su cabecera")
+            consume(len)
             return null
         }
         if (hl == 16) rxSeq = bb.getShort(12).toInt() and 0xFFFF
-        val payload = pending.copyOfRange(hl, len)
-        pending = pending.copyOfRange(len, pending.size)
+        val payload = rbuf.copyOfRange(hl, len)
+        consume(len)
         return Packet(proto, payload)
     }
 
-    private fun recv(timeoutMs: Int): Packet? {
+    private fun readPacket(timeoutMs: Int): Packet? {
         val end = System.currentTimeMillis() + timeoutMs
-        val buf = ByteArray(16384)
         while (true) {
             val p = parseOne()
             if (p != null) return p
             val left = (end - System.currentTimeMillis()).toInt()
             if (left <= 0) return null
-            val n = conn.bulkTransfer(epIn, buf, buf.size, minOf(left, 500))
-            if (n > 0) pending += buf.copyOf(n)
+            val n = conn.bulkTransfer(epIn, inBuf, inBuf.size, minOf(left, 300))
+            if (n > 0) {
+                ensure(rlen + n)
+                System.arraycopy(inBuf, 0, rbuf, rlen, n)
+                rlen += n
+            }
         }
     }
 
@@ -99,7 +202,7 @@ class MuxSession(
         val vp = ByteBuffer.allocate(12).order(ByteOrder.BIG_ENDIAN).putInt(2).putInt(0).putInt(0).array()
         log("-> VERSION (major=2)")
         if (!send(0, vp)) return false
-        val p = recv(4000)
+        val p = readPacket(4000)
         if (p == null) {
             log("Sin respuesta al VERSION en 4 s")
             return false
@@ -118,127 +221,116 @@ class MuxSession(
         return true
     }
 
-    // ---- TCP minimo ----
-    private var sport = 1
-    private var dport = 0
-    private var seqOut = 0L
-    private var ackOut = 0L
+    /** Despues del handshake: un hilo lee paquetes y los reparte a cada conexion. */
+    fun start() {
+        running = true
+        val t = Thread { readerLoop() }
+        t.isDaemon = true
+        t.start()
+    }
 
-    private fun tcpBytes(flags: Int, data: ByteArray): ByteArray {
+    fun stop() {
+        running = false
+        for (c in conns.values) c.markClosed()
+        conns.clear()
+    }
+
+    private fun readerLoop() {
+        while (running) {
+            val p = try {
+                readPacket(300)
+            } catch (e: Exception) {
+                log("Lector USB: ${e.javaClass.simpleName}: ${e.message}")
+                break
+            }
+            if (p == null) continue
+            try {
+                dispatch(p)
+            } catch (e: Exception) {
+                log("Error procesando paquete: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }
+        for (c in conns.values) c.markClosed()
+    }
+
+    private fun dispatch(p: Packet) {
+        if (p.proto != 6) {
+            log("<- paquete usbmux proto=${p.proto} ${hex(p.payload, 32)}")
+            return
+        }
+        val pl = p.payload
+        if (pl.size < 20) return
+        val bb = ByteBuffer.wrap(pl).order(ByteOrder.BIG_ENDIAN)
+        val dp = bb.getShort(2).toInt() and 0xffff
+        val seq = bb.getInt(4).toLong() and 0xffffffffL
+        val off = ((pl[12].toInt() and 0xf0) shr 4) * 4
+        val flags = pl[13].toInt() and 0xff
+        val c = conns[dp] ?: return
+        if ((flags and 0x04) != 0) {
+            log("RST recibido (puerto ${c.dport})")
+            c.refused = true
+            c.markClosed()
+            conns.remove(dp)
+            return
+        }
+        if ((flags and 0x12) == 0x12 && c.seqOut == 0L) {
+            c.ackOut = seq + 1
+            c.seqOut = 1
+            sendTcp(c, 0x10, ByteArray(0), false)
+            c.established.countDown()
+            return
+        }
+        val data = pl.copyOfRange(minOf(off, pl.size), pl.size)
+        if (data.isNotEmpty()) {
+            c.ackOut += data.size
+            sendTcp(c, 0x10, ByteArray(0), false)
+            c.deliver(data)
+        }
+        if ((flags and 0x01) != 0) c.markClosed()
+    }
+
+    internal fun sendTcp(c: MuxConn, flags: Int, data: ByteArray, advance: Boolean): Boolean = synchronized(sendLock) {
         val bb = ByteBuffer.allocate(20 + data.size).order(ByteOrder.BIG_ENDIAN)
-        bb.putShort(sport.toShort())
-        bb.putShort(dport.toShort())
-        bb.putInt(seqOut.toInt())
-        bb.putInt(ackOut.toInt())
+        bb.putShort(c.sport.toShort())
+        bb.putShort(c.dport.toShort())
+        bb.putInt(c.seqOut.toInt())
+        bb.putInt(c.ackOut.toInt())
         bb.put(0x50.toByte())
         bb.put(flags.toByte())
         bb.putShort(512.toShort())
         bb.putShort(0.toShort())
         bb.putShort(0.toShort())
         bb.put(data)
-        return bb.array()
+        val ok = send(6, bb.array())
+        if (ok && advance) c.seqOut += data.size
+        ok
     }
 
-    fun tcpConnect(port: Int): Boolean {
-        dport = port
-        seqOut = 0
-        ackOut = 0
-        log("-> SYN al puerto $port")
-        if (!send(6, tcpBytes(0x02, ByteArray(0)))) return false
-        val end = System.currentTimeMillis() + 4000
-        while (true) {
-            val left = (end - System.currentTimeMillis()).toInt()
-            if (left <= 0) {
-                log("Sin SYN/ACK en 4 s")
-                return false
-            }
-            val p = recv(left)
-            if (p == null) {
-                log("Sin SYN/ACK en 4 s")
-                return false
-            }
-            if (p.proto != 6 || p.payload.size < 20) {
-                log("<- ignoro proto=${p.proto} ${hex(p.payload)}")
-                continue
-            }
-            val bb = ByteBuffer.wrap(p.payload).order(ByteOrder.BIG_ENDIAN)
-            val flags = bb.get(13).toInt() and 0xff
-            log("<- TCP flags=0x${flags.toString(16)}")
-            if ((flags and 0x04) != 0) {
-                log("El iPod rechazo la conexion (RST)")
-                return false
-            }
-            if ((flags and 0x12) == 0x12) {
-                ackOut = (bb.getInt(4).toLong() and 0xffffffffL) + 1
-                seqOut = 1
-                send(6, tcpBytes(0x10, ByteArray(0)))
-                log("Conexion TCP establecida")
-                return true
-            }
+    internal fun remove(c: MuxConn) {
+        conns.remove(c.sport)
+    }
+
+    fun open(port: Int, timeoutMs: Long = 4000): MuxConn? {
+        val sport = synchronized(this) { nextPort++ }
+        val c = MuxConn(this, sport, port)
+        conns[sport] = c
+        log("-> SYN al puerto $port (origen $sport)")
+        if (!sendTcp(c, 0x02, ByteArray(0), false)) {
+            conns.remove(sport)
+            return null
         }
-    }
-
-    private fun tcpSend(data: ByteArray): Boolean {
-        var off = 0
-        while (off < data.size) {
-            val n = minOf(4096, data.size - off)
-            val chunk = data.copyOfRange(off, off + n)
-            if (!send(6, tcpBytes(0x10, chunk))) return false
-            seqOut += n
-            off += n
+        val ok = c.established.await(timeoutMs, TimeUnit.MILLISECONDS)
+        if (!ok) {
+            log("Sin SYN/ACK en ${timeoutMs / 1000} s")
+            conns.remove(sport)
+            return null
         }
-        return true
-    }
-
-    private fun tcpRecv(timeoutMs: Int): ByteArray? {
-        val end = System.currentTimeMillis() + timeoutMs
-        while (true) {
-            val left = (end - System.currentTimeMillis()).toInt()
-            if (left <= 0) return null
-            val p = recv(left)
-            if (p == null) return null
-            if (p.proto != 6 || p.payload.size < 20) continue
-            val bb = ByteBuffer.wrap(p.payload).order(ByteOrder.BIG_ENDIAN)
-            val off = ((bb.get(12).toInt() and 0xf0) shr 4) * 4
-            val flags = bb.get(13).toInt() and 0xff
-            if ((flags and 0x04) != 0) {
-                log("RST recibido")
-                return null
-            }
-            val data = p.payload.copyOfRange(minOf(off, p.payload.size), p.payload.size)
-            if (data.isNotEmpty()) {
-                ackOut += data.size
-                send(6, tcpBytes(0x10, ByteArray(0)))
-                return data
-            }
+        if (c.refused || c.closed) {
+            log("El iPod rechazo la conexion al puerto $port")
+            conns.remove(sport)
+            return null
         }
-    }
-
-    fun lockdownRequest(xml: String): String? {
-        val body = xml.toByteArray()
-        val msg = ByteBuffer.allocate(4 + body.size).order(ByteOrder.BIG_ENDIAN).putInt(body.size).put(body).array()
-        if (!tcpSend(msg)) return null
-        var buf = ByteArray(0)
-        var need = -1
-        val end = System.currentTimeMillis() + 5000
-        while (true) {
-            val left = (end - System.currentTimeMillis()).toInt()
-            if (left <= 0) {
-                log("Respuesta incompleta (${buf.size} bytes)")
-                return null
-            }
-            val d = tcpRecv(left)
-            if (d == null) return null
-            buf += d
-            if (need < 0 && buf.size >= 4) {
-                need = ByteBuffer.wrap(buf).order(ByteOrder.BIG_ENDIAN).getInt(0)
-            }
-            if (need < 0 || need > (4 shl 20)) continue
-            if (buf.size >= 4 + need) return String(buf, 4, need)
-        }
-    }
-
-    fun tcpClose() {
-        send(6, tcpBytes(0x04, ByteArray(0)))
+        log("Conexion TCP establecida (puerto $port)")
+        return c
     }
 }
