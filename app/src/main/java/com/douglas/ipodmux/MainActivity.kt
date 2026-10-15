@@ -472,9 +472,9 @@ class MainActivity : Activity() {
         nowPane.setPadding(dp(16), dp(10), dp(16), dp(10))
         nowPane.setBackgroundColor(Color.WHITE)
         nowCount = tv(15f, 0xFF666666.toInt())
-        nowTitle = tv(24f, Color.BLACK, true)
-        nowArtist = tv(20f, 0xFF222222.toInt())
-        nowAlbum = tv(18f, 0xFF666666.toInt())
+        nowTitle = tv(28f, Color.BLACK, true)
+        nowArtist = tv(22f, 0xFF222222.toInt())
+        nowAlbum = tv(20f, 0xFF666666.toInt())
         nowStatus = tv(15f, 0xFFB00020.toInt())
         nowElapsed = tv(16f, 0xFF333333.toInt())
         nowRemain = tv(16f, 0xFF333333.toInt())
@@ -505,7 +505,7 @@ class MainActivity : Activity() {
 
         val mid = LinearLayout(this)
         mid.orientation = LinearLayout.HORIZONTAL
-        mid.addView(artBox, LinearLayout.LayoutParams(dp(120), dp(120)))
+        mid.addView(artBox, LinearLayout.LayoutParams(dp(260), dp(260)))
         val tl = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         tl.leftMargin = dp(14)
         mid.addView(texts, tl)
