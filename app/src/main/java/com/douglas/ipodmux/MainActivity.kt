@@ -8,6 +8,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -24,6 +25,7 @@ import android.view.ViewGroup
 import android.widget.BaseAdapter
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.ProgressBar
@@ -50,8 +52,12 @@ class MainActivity : Activity() {
     private lateinit var nowAlbum: TextView
     private lateinit var nowCount: TextView
     private lateinit var nowStatus: TextView
-    private lateinit var nowTime: TextView
-    private lateinit var nowBar: ProgressBar
+    private lateinit var nowElapsed: TextView
+    private lateinit var nowRemain: TextView
+    private lateinit var nowBar: IpodBarView
+    private lateinit var nowArt: ImageView
+    private lateinit var nowNote: TextView
+    private var shownArt: Bitmap? = null
     private lateinit var logPane: LinearLayout
     private lateinit var logView: TextView
     private lateinit var logScroll: ScrollView
@@ -157,6 +163,7 @@ class MainActivity : Activity() {
 
     private fun musicMenu(lib: Library): Screen {
         val items = ArrayList<MenuItem>()
+        items.add(MenuItem("Playlists") { push(playlistsMenu(lib)) })
         items.add(MenuItem("Artistas") {
             push(Screen("Artistas", lib.artists.map { a -> MenuItem(a.first) { push(trackMenu(a.first, a.second)) } }))
         })
@@ -165,6 +172,13 @@ class MainActivity : Activity() {
         })
         items.add(MenuItem("Canciones") { push(trackMenu("Canciones", lib.tracks)) })
         return Screen("Música", items)
+    }
+
+    private fun playlistsMenu(lib: Library): Screen {
+        if (lib.playlists.isEmpty()) {
+            return Screen("Playlists", listOf(MenuItem("(no hay playlists)", false) {}))
+        }
+        return Screen("Playlists", lib.playlists.map { p -> MenuItem(p.first) { push(trackMenu(p.first, p.second)) } })
     }
 
     private fun trackMenu(title: String, tracks: List<Track>): Screen {
@@ -293,8 +307,10 @@ class MainActivity : Activity() {
             nowAlbum.text = ""
             nowCount.text = ""
             nowStatus.text = ""
-            nowTime.text = ""
-            nowBar.progress = 0
+            nowElapsed.text = ""
+            nowRemain.text = ""
+            nowBar.fraction = 0f
+            showArt(null)
             return
         }
         nowTitle.text = t.title
@@ -304,8 +320,17 @@ class MainActivity : Activity() {
         nowStatus.text = Player.statusText
         val dur = Player.duration()
         val pos = Player.position()
-        nowTime.text = if (dur > 0) "${fmt(pos)} / ${fmt(dur)}" else fmt(pos)
-        nowBar.progress = if (dur > 0) (pos.toLong() * 1000 / dur).toInt() else 0
+        nowElapsed.text = fmt(pos)
+        nowRemain.text = if (dur > 0) "-" + fmt(maxOf(0, dur - pos)) else ""
+        nowBar.fraction = if (dur > 0) pos.toFloat() / dur else 0f
+        showArt(Player.art)
+    }
+
+    private fun showArt(b: Bitmap?) {
+        if (b === shownArt) return
+        shownArt = b
+        nowArt.setImageBitmap(b)
+        nowNote.visibility = if (b == null) View.VISIBLE else View.GONE
     }
 
     private val ticker = object : Runnable {
@@ -444,25 +469,60 @@ class MainActivity : Activity() {
 
         nowPane = LinearLayout(this)
         nowPane.orientation = LinearLayout.VERTICAL
-        nowPane.setPadding(dp(20), dp(14), dp(20), dp(10))
+        nowPane.setPadding(dp(16), dp(10), dp(16), dp(10))
         nowPane.setBackgroundColor(Color.WHITE)
-        nowCount = tv(16f, 0xFF666666.toInt())
-        nowTitle = tv(26f, Color.BLACK, true)
-        nowArtist = tv(22f, 0xFF222222.toInt())
-        nowAlbum = tv(20f, 0xFF666666.toInt())
-        nowStatus = tv(16f, 0xFFB00020.toInt())
-        nowTime = tv(18f, 0xFF333333.toInt())
-        nowBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
-        nowBar.max = 1000
+        nowCount = tv(15f, 0xFF666666.toInt())
+        nowTitle = tv(24f, Color.BLACK, true)
+        nowArtist = tv(20f, 0xFF222222.toInt())
+        nowAlbum = tv(18f, 0xFF666666.toInt())
+        nowStatus = tv(15f, 0xFFB00020.toInt())
+        nowElapsed = tv(16f, 0xFF333333.toInt())
+        nowRemain = tv(16f, 0xFF333333.toInt())
+        nowRemain.gravity = Gravity.END
+        nowBar = IpodBarView(this)
+
+        // caratula del album (o una nota musical si el archivo no trae)
+        val artBox = FrameLayout(this)
+        val artBg = GradientDrawable()
+        artBg.setColor(0xFFE2E2E2.toInt())
+        artBg.setStroke(dp(1), 0xFFB0B0B0.toInt())
+        artBg.cornerRadius = dp(4).toFloat()
+        artBox.background = artBg
+        nowNote = tv(48f, 0xFF9A9A9A.toInt(), true)
+        nowNote.text = "\u266A"
+        nowNote.gravity = Gravity.CENTER
+        artBox.addView(nowNote, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        nowArt = ImageView(this)
+        nowArt.scaleType = ImageView.ScaleType.CENTER_CROP
+        artBox.addView(nowArt, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+
+        val texts = LinearLayout(this)
+        texts.orientation = LinearLayout.VERTICAL
+        texts.addView(nowTitle)
+        texts.addView(nowArtist)
+        texts.addView(nowAlbum)
+        texts.addView(nowStatus)
+
+        val mid = LinearLayout(this)
+        mid.orientation = LinearLayout.HORIZONTAL
+        mid.addView(artBox, LinearLayout.LayoutParams(dp(120), dp(120)))
+        val tl = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        tl.leftMargin = dp(14)
+        mid.addView(texts, tl)
+
+        val times = LinearLayout(this)
+        times.orientation = LinearLayout.HORIZONTAL
+        times.addView(nowElapsed, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        times.addView(nowRemain, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
         nowPane.addView(nowCount)
-        nowPane.addView(nowTitle)
-        nowPane.addView(nowArtist)
-        nowPane.addView(nowAlbum)
-        nowPane.addView(nowStatus)
+        val ml = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        ml.topMargin = dp(6)
+        nowPane.addView(mid, ml)
         val sp = View(this)
         nowPane.addView(sp, LinearLayout.LayoutParams(1, 0, 1f))
-        nowPane.addView(nowBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(14)))
-        nowPane.addView(nowTime)
+        nowPane.addView(nowBar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(16)))
+        nowPane.addView(times, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         body.addView(nowPane, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
 
         logPane = LinearLayout(this)
@@ -505,7 +565,7 @@ class MainActivity : Activity() {
         Player.onLog = { log(it) }
         Player.onChange = { updateNow() }
 
-        log("iPod USB v0.3 - Android ${Build.VERSION.RELEASE}")
+        log("iPod USB v0.4 - Android ${Build.VERSION.RELEASE}")
         push(mainMenu())
         applyMode()
         ui.post(ticker)
