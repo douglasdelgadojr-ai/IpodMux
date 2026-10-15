@@ -17,7 +17,11 @@ class Track(
     var year: Int
 )
 
-class Library(all: List<Track>, val hasMetadata: Boolean) {
+class Library(
+    all: List<Track>,
+    val hasMetadata: Boolean,
+    val playlists: List<Pair<String, List<Track>>> = emptyList()
+) {
     val tracks: List<Track> = all.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
 
     private fun albumOrder() = compareBy<Track>({ it.discNo }, { it.trackNo }, { it.title.lowercase() })
@@ -46,17 +50,17 @@ object ITunesDb {
 
     private val audioExt = setOf("mp3", "m4a", "aac", "wav", "aif", "aiff", "m4b", "m4p", "flac", "ogg")
 
-    fun parse(data0: ByteArray, log: (String) -> Unit): List<Track>? {
-        var data = data0
-        if (data.size < 16 || tag(data, 0) != "mhbd") {
-            log("iTunesDB: no empieza con mhbd (primeros bytes: ${hex(data, 8)})")
+    /** Devuelve la base de datos lista para leer (descomprime el iTunesCDB si hace falta). */
+    private fun unpack(data0: ByteArray, log: (String) -> Unit): ByteArray? {
+        if (data0.size < 16 || tag(data0, 0) != "mhbd") {
+            log("iTunesDB: no empieza con mhbd (primeros bytes: ${hex(data0, 8)})")
             return null
         }
-        val base = u32(data, 4).toInt()
-        if (data.size >= base + 4 && tag(data, base) != "mhsd") {
+        val base = u32(data0, 4).toInt()
+        if (data0.size >= base + 4 && tag(data0, base) != "mhsd") {
             // iTunesCDB: lo que sigue a la cabecera esta comprimido con zlib
             val inf = Inflater()
-            inf.setInput(data, base, data.size - base)
+            inf.setInput(data0, base, data0.size - base)
             val out = ByteArrayOutputStream()
             val buf = ByteArray(65536)
             try {
@@ -69,9 +73,15 @@ object ITunesDb {
                 log("iTunesCDB: error al descomprimir: ${e.message}")
                 return null
             }
-            data = data.copyOfRange(0, base) + out.toByteArray()
             log("iTunesCDB descomprimido: ${out.size()} bytes")
+            return data0.copyOfRange(0, base) + out.toByteArray()
         }
+        return data0
+    }
+
+    fun parse(data0: ByteArray, log: (String) -> Unit): List<Track>? {
+        val data = unpack(data0, log) ?: return null
+        val base = u32(data, 4).toInt()
         val tracks = ArrayList<Track>()
         var pos = base
         try {
@@ -141,6 +151,80 @@ object ITunesDb {
             }
             if (itTotal <= 0) break
             p += itTotal
+        }
+    }
+
+    /** Lee las playlists del iPod. Cada una trae solo las canciones que existen en [tracks]. */
+    fun parsePlaylists(data0: ByteArray, tracks: List<Track>, log: (String) -> Unit): List<Pair<String, List<Track>>> {
+        val data = unpack(data0, log) ?: return emptyList()
+        val byId = HashMap<Long, Track>()
+        for (t in tracks) byId[t.id] = t
+        val found = LinkedHashMap<String, Pair<String, List<Track>>>()
+        try {
+            for (wanted in listOf(intArrayOf(2, 3), intArrayOf(5))) {
+                var pos = u32(data, 4).toInt()
+                while (pos + 16 <= data.size && tag(data, pos) == "mhsd") {
+                    val hdr = u32(data, pos + 4).toInt()
+                    val total = u32(data, pos + 8).toInt()
+                    val type = u32(data, pos + 12).toInt()
+                    log("iTunesDB seccion tipo $type")
+                    if (type in wanted) parsePlaylistList(data, pos + hdr, byId, found)
+                    if (total <= 0) break
+                    pos += total
+                }
+                if (found.isNotEmpty()) break
+            }
+        } catch (e: Exception) {
+            log("Playlists: error de lectura (${e.javaClass.simpleName}: ${e.message})")
+        }
+        return found.values.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.first })
+    }
+
+    private fun parsePlaylistList(d: ByteArray, listPos: Int, byId: Map<Long, Track>, out: MutableMap<String, Pair<String, List<Track>>>) {
+        if (tag(d, listPos) != "mhlp") return
+        val hdr = u32(d, listPos + 4).toInt()
+        val count = u32(d, listPos + 8).toInt()
+        var p = listPos + hdr
+        for (i in 0 until count) {
+            if (tag(d, p) != "mhyp" || p + 36 > d.size) break
+            val yHdr = u32(d, p + 4).toInt()
+            val yTotal = u32(d, p + 8).toInt()
+            val nMhod = u32(d, p + 12).toInt()
+            val nMhip = u32(d, p + 16).toInt()
+            val master = (d[p + 20].toInt() and 0xff) != 0
+            val pid = u32(d, p + 28) or (u32(d, p + 32) shl 32)
+            var name = ""
+            var m = p + yHdr
+            for (k in 0 until nMhod) {
+                if (tag(d, m) != "mhod") break
+                val mTotal = u32(d, m + 8).toInt()
+                val type = u32(d, m + 12).toInt()
+                if (type == 1) {
+                    val len = u32(d, m + 28).toInt()
+                    val enc = u32(d, m + 32).toInt()
+                    if (len > 0 && m + 40 + len <= d.size) {
+                        name = if (enc == 2) String(d, m + 40, len, Charsets.UTF_8) else String(d, m + 40, len, Charsets.UTF_16LE)
+                    }
+                }
+                if (mTotal <= 0) break
+                m += mTotal
+            }
+            val members = ArrayList<Track>()
+            var q = m
+            for (k in 0 until nMhip) {
+                if (tag(d, q) != "mhip") break
+                val t = byId[u32(d, q + 24)]
+                if (t != null) members.add(t)
+                val qTotal = u32(d, q + 8).toInt()
+                if (qTotal <= 0) break
+                q += qTotal
+            }
+            if (!master && name.isNotBlank() && members.isNotEmpty()) {
+                val key = if (pid != 0L) pid.toString() else name + "#" + members.size
+                if (!out.containsKey(key)) out[key] = Pair(name, members)
+            }
+            if (yTotal <= 0) break
+            p += yTotal
         }
     }
 
