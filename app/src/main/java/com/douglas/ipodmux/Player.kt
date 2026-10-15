@@ -1,6 +1,9 @@
 package com.douglas.ipodmux
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.media.MediaMetadataRetriever
 import android.media.AudioManager
 import android.media.MediaMetadata
 import android.media.MediaPlayer
@@ -20,6 +23,7 @@ object Player {
     @Volatile var playing = false
     @Volatile var loading = false
     @Volatile var statusText = ""
+    @Volatile var art: Bitmap? = null
     var onChange: (() -> Unit)? = null
     var onLog: ((String) -> Unit)? = null
 
@@ -115,6 +119,7 @@ object Player {
         queue = emptyList()
         index = -1
         statusText = ""
+        art = null
         notifyChange()
     }
 
@@ -130,13 +135,17 @@ object Player {
         val my = ++token
         wantedId = t.id
         stopPlayer()
+        art = null
         loading = true
         statusText = "Cargando..."
         notifyChange()
         worker.execute {
             val f = fetch(t, showProgress = true) { wantedId != t.id }
+            val bmp = if (f != null) loadArt(f) else null
+            if (f != null) onLog?.invoke(if (bmp != null) "Caratula: ${bmp.width}x${bmp.height}" else "Caratula: este archivo no trae")
             main.post {
                 if (my != token) return@post
+                art = bmp
                 if (f == null) {
                     loading = false
                     statusText = "No pude leer la cancion del iPod"
@@ -181,6 +190,27 @@ object Player {
         if (!tmp.renameTo(f)) return null
         trimCache()
         return f
+    }
+
+    /** Saca la caratula que viene dentro del archivo de audio (si la tiene). */
+    private fun loadArt(f: File): Bitmap? {
+        val r = MediaMetadataRetriever()
+        try {
+            r.setDataSource(f.absolutePath)
+            val b = r.embeddedPicture ?: return null
+            val o = BitmapFactory.Options()
+            o.inJustDecodeBounds = true
+            BitmapFactory.decodeByteArray(b, 0, b.size, o)
+            var s = 1
+            while (o.outWidth / (s * 2) >= 400 && o.outHeight / (s * 2) >= 400) s *= 2
+            val o2 = BitmapFactory.Options()
+            o2.inSampleSize = s
+            return BitmapFactory.decodeByteArray(b, 0, b.size, o2)
+        } catch (e: Exception) {
+            return null
+        } finally {
+            try { r.release() } catch (e: Exception) {}
+        }
     }
 
     private fun trimCache() {
