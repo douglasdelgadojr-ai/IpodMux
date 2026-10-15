@@ -201,6 +201,7 @@ object IpodSession {
         val itunes = a.listDir("/iTunes_Control/iTunes")
         log("/iTunes_Control/iTunes: $itunes")
         var best: List<Track>? = null
+        var bestRaw: ByteArray? = null
         for (name in listOf("iTunesCDB", "iTunesDB")) {
             if (itunes == null || !itunes.contains(name)) continue
             val raw = a.readAll("/iTunes_Control/iTunes/$name")
@@ -211,12 +212,19 @@ object IpodSession {
             log("$name: ${raw.size} bytes")
             val t = ITunesDb.parse(raw, log)
             log("$name -> ${t?.size ?: 0} canciones")
-            if (t != null && (best == null || t.size > best.size)) best = t
+            if (t != null && (best == null || t.size > best.size)) {
+                best = t
+                bestRaw = raw
+            }
         }
         val lib: Library
         if (best != null && best.isNotEmpty()) {
             for (t in best.take(3)) log("Ej: '${t.title}' / ${t.artist} / ${t.album} -> ${t.path}")
-            lib = Library(best, true)
+            val raw0 = bestRaw
+            val pls: List<Pair<String, List<Track>>> =
+                if (raw0 != null) ITunesDb.parsePlaylists(raw0, best, log) else emptyList()
+            log("Playlists: ${pls.size}")
+            lib = Library(best, true, pls)
         } else {
             log("Sin base de datos legible: listo los archivos de /iTunes_Control/Music")
             val files = ITunesDb.scanFiles(a, log)
