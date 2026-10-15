@@ -30,10 +30,7 @@ class TlsBridge(
     private val ctx: SSLContext,
     private val inS: InputStream,
     private val outS: OutputStream,
-    private val protocols: Array<String>? = arrayOf("TLSv1"),
-    private val pickSuites: ((Array<String>) -> Array<String>)? = null,
-    private val sni: Boolean = true,
-    private val log: (String) -> Unit = {}
+    private val protocols: Array<String>? = arrayOf("TLSv1")
 ) {
     private fun pump(from: InputStream, to: OutputStream, s: Socket) {
         val buf = ByteArray(16384)
@@ -71,20 +68,27 @@ class TlsBridge(
         acceptor.start()
         val raw = Socket("127.0.0.1", port)
         raw.tcpNoDelay = true
-        val host: String? = if (sni) "ipod" else null
-        val ssl = ctx.socketFactory.createSocket(raw, host, port, true) as SSLSocket
+        val ssl = ctx.socketFactory.createSocket(raw, "ipod", port, true) as SSLSocket
         ssl.useClientMode = true
         if (protocols != null) ssl.enabledProtocols = protocols
-        val pick = pickSuites
-        if (pick != null) {
-            val sel = pick(ssl.supportedCipherSuites)
-            log("Suites elegidas: ${sel.joinToString()}")
-            if (sel.isEmpty()) throw IOException("este Android no ofrece esas suites")
-            ssl.enabledCipherSuites = sel
-        }
+        // TLS 1.0 + cifrado CBC hace que Android parta el primer dato en 2 registros (1 byte + resto),
+        // y el iPod viejo corta la conexion. RC4 es de flujo y no se parte.
+        val rc4 = ssl.supportedCipherSuites.filter { it.contains("_RSA_WITH_RC4_128_SHA") && !it.contains("ECDHE") }
+        val useRc4 = preferRc4 && rc4.isNotEmpty()
+        if (useRc4) ssl.enabledCipherSuites = rc4.toTypedArray()
         ssl.soTimeout = 15000
-        ssl.startHandshake()
+        try {
+            ssl.startHandshake()
+        } catch (e: Exception) {
+            if (useRc4) preferRc4 = false // el siguiente intento usa los cifrados normales
+            try { ssl.close() } catch (x: Exception) {}
+            throw e
+        }
         return ssl
+    }
+
+    companion object {
+        @Volatile var preferRc4 = true
     }
 }
 
@@ -104,11 +108,7 @@ class Lockdown(private val log: (String) -> Unit, private var inS: InputStream, 
             System.arraycopy(xml, 0, msg, 4, xml.size)
             outS.write(msg)
             outS.flush()
-            val h = readFully(inS, 4)
-            if (h == null) {
-                log("lockdownd: el iPod cerro la conexion")
-                return null
-            }
+            val h = readFully(inS, 4) ?: return null
             val n = ByteBuffer.wrap(h).order(ByteOrder.BIG_ENDIAN).getInt(0)
             if (n < 0 || n > (4 shl 20)) {
                 log("lockdownd: largo raro $n")
