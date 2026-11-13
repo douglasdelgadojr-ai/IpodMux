@@ -78,13 +78,18 @@ object Player {
             s.setPlaybackState(pb)
             val t = current
             if (t != null) {
-                val md = MediaMetadata.Builder()
+                val b = MediaMetadata.Builder()
                     .putString(MediaMetadata.METADATA_KEY_TITLE, t.title)
                     .putString(MediaMetadata.METADATA_KEY_ARTIST, t.artist)
                     .putString(MediaMetadata.METADATA_KEY_ALBUM, t.album)
                     .putLong(MediaMetadata.METADATA_KEY_DURATION, duration().toLong())
-                    .build()
-                s.setMetadata(md)
+                val a = art
+                if (a != null) {
+                    b.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, a)
+                    b.putBitmap(MediaMetadata.METADATA_KEY_ART, a)
+                    b.putBitmap(MediaMetadata.METADATA_KEY_DISPLAY_ICON, a)
+                }
+                s.setMetadata(b.build())
             }
         } catch (e: Exception) {
         }
@@ -146,6 +151,7 @@ object Player {
             main.post {
                 if (my != token) return@post
                 art = bmp
+                updateSession()
                 if (f == null) {
                     loading = false
                     statusText = "No pude leer la cancion del iPod"
